@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Environment files (contain secrets)
+.env
+.env.local
+.env.*.local
+
+# Output directories
+dam-downloads/
+downloads/
+output/
+
+# Reports and logs
+*.log
+*-report.json
+search-results-*.json
+search-paths-*.json
+
+# Metadata files (optional - uncomment if you want to ignore)
+# *.metadata.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
