@@ -323,9 +323,6 @@ node aem.js --query my-assets.json
 
 MIT License - see [LICENSE](LICENSE) for details.
 
-## Disclaimer
-
-This is an unofficial tool not affiliated with Adobe. See [DISCLAIMER.md](DISCLAIMER.md) for important legal information.
 
 ## Contributing
 
