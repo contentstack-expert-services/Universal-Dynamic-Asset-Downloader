@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+// Optional .env loader — safe no-op if env is already set (e.g. via dotenvx) or dotenv isn't installed.
+try { require("dotenv").config(); } catch (e) { /* dotenv not installed; env vars assumed pre-set */ }
+
 const path = require("path");
 const fs = require("fs");
 const https = require("https");
@@ -113,6 +116,10 @@ function makeRequest(url, options = {}) {
             resolve(result);
           }
         } catch (e) {
+          const trimmed = (data || '').trimStart();
+          if (trimmed.startsWith('<')) {
+            return reject(new Error('HTML response (likely expired/invalid cookie or wrong URL)'));
+          }
           resolve(data);
         }
       });
@@ -157,6 +164,16 @@ const formatBytes = (bytes) => {
 
 const ensureDirectory = (dirPath) => {
   fs.mkdirSync(dirPath, { recursive: true });
+};
+
+// Normalize a JCR/DAM folder path: ensure single leading slash, no trailing slash,
+// and collapse any internal `//`. Returns '/' for empty input.
+const normalizeFolderPath = (p) => {
+  if (!p || typeof p !== 'string') return '/';
+  let out = p.trim().replace(/\/+/g, '/');
+  if (!out.startsWith('/')) out = '/' + out;
+  if (out.length > 1 && out.endsWith('/')) out = out.slice(0, -1);
+  return out;
 };
 
 // ============================================
@@ -553,8 +570,13 @@ async function findMultipleAssets(patterns) {
 async function searchInFolder(folderPath, pattern) {
   config.stats.foldersScanned++;
 
-  const jsonDepths = ['.1.json', '.json', '.2.json', '.3.json'];
+  const jsonDepths = config.smartDepthDetection
+    ? ['.1.json', '.json', '.2.json', '.3.json', '.4.json', '.5.json']
+    : ['.1.json', '.json'];
+
   let bestData = null;
+  let maxItems = 0;
+  const errors = [];
 
   for (const jsonDepth of jsonDepths) {
     try {
@@ -562,15 +584,21 @@ async function searchInFolder(folderPath, pattern) {
       const data = await makeRequestWithRetry(url);
 
       if (data && typeof data === 'object') {
-        bestData = data;
-        break; // Use first successful response
+        const itemCount = Object.keys(data).filter(k => !k.startsWith('jcr:') && !k.startsWith(':')).length;
+        if (itemCount > maxItems || (bestData === null && itemCount >= 0)) {
+          maxItems = itemCount;
+          bestData = data;
+          if (itemCount > 50) break;
+        }
       }
     } catch (error) {
-      // Silent fail, try next depth
+      errors.push(`${jsonDepth}: ${error.message}`);
     }
   }
 
   if (!bestData) {
+    console.log(`Warning: could not load ${folderPath} (all depths failed)`);
+    if (errors.length) console.log(`   ${errors.join('; ')}`);
     return [];
   }
 
@@ -584,8 +612,13 @@ async function searchInFolder(folderPath, pattern) {
 async function searchInFolderMultiple(folderPath, patterns) {
   config.stats.foldersScanned++;
 
-  const jsonDepths = ['.1.json', '.json', '.2.json', '.3.json'];
+  const jsonDepths = config.smartDepthDetection
+    ? ['.1.json', '.json', '.2.json', '.3.json', '.4.json', '.5.json']
+    : ['.1.json', '.json'];
+
   let bestData = null;
+  let maxItems = 0;
+  const errors = [];
 
   for (const jsonDepth of jsonDepths) {
     try {
@@ -593,15 +626,21 @@ async function searchInFolderMultiple(folderPath, patterns) {
       const data = await makeRequestWithRetry(url);
 
       if (data && typeof data === 'object') {
-        bestData = data;
-        break; // Use first successful response
+        const itemCount = Object.keys(data).filter(k => !k.startsWith('jcr:') && !k.startsWith(':')).length;
+        if (itemCount > maxItems || (bestData === null && itemCount >= 0)) {
+          maxItems = itemCount;
+          bestData = data;
+          if (itemCount > 50) break;
+        }
       }
     } catch (error) {
-      // Silent fail, try next depth
+      errors.push(`${jsonDepth}: ${error.message}`);
     }
   }
 
   if (!bestData) {
+    console.log(`Warning: could not load ${folderPath} (all depths failed)`);
+    if (errors.length) console.log(`   ${errors.join('; ')}`);
     return [];
   }
 
@@ -875,6 +914,7 @@ async function scanFolder(folderPath, depth = 0) {
   let bestData = null;
   let bestDepth = null;
   let maxItems = 0;
+  const errors = [];
 
   for (const jsonDepth of jsonDepths) {
     try {
@@ -895,11 +935,13 @@ async function scanFolder(folderPath, depth = 0) {
         }
       }
     } catch (error) {
-      // Silent fail, try next depth
+      errors.push(`${jsonDepth}: ${error.message}`);
     }
   }
 
   if (!bestData) {
+    console.log(`Warning: could not load ${folderPath} (all depths failed)`);
+    if (errors.length) console.log(`   ${errors.join('; ')}`);
     return;
   }
 
@@ -1227,12 +1269,12 @@ async function downloadAllAssets(assets) {
  */
 async function downloadAsset(assetInfo) {
   try {
-    // Create output path
-    const relativePath = assetInfo.path.replace('/content/dam', '').replace(/^\//, '');
-    const outputDir = path.join(config.outputDir, path.dirname(relativePath));
+    // Flat output: every asset lands directly under config.outputDir, by filename only.
+    // (DAM hierarchy is preserved in the metadata.json sidecar, not the on-disk path.)
+    const outputDir = config.outputDir;
     ensureDirectory(outputDir);
 
-    const outputPath = path.join(config.outputDir, relativePath);
+    const outputPath = path.join(outputDir, assetInfo.name);
 
     // Check if already exists
     if (fs.existsSync(outputPath)) {
@@ -1926,7 +1968,11 @@ Features:
       if (config.queryMode || config.findMode) {
         console.log('Warning: --folder ignored in query/find mode');
       } else {
-        config.folderQueue = [args[i + 1]];
+        const normalized = normalizeFolderPath(args[i + 1]);
+        if (normalized !== args[i + 1]) {
+          console.log(`Normalized folder path: "${args[i + 1]}" -> "${normalized}"`);
+        }
+        config.folderQueue = [normalized];
       }
       i++;
     } else if (args[i] === '--no-renditions') {
