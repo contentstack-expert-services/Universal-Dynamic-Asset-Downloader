@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+// Optional .env loader — safe no-op if env is already set (e.g. via dotenvx) or dotenv isn't installed.
+try { require("dotenv").config(); } catch (e) { /* dotenv not installed; env vars assumed pre-set */ }
+
 const path = require("path");
 const fs = require("fs");
 const https = require("https");
@@ -113,6 +116,10 @@ function makeRequest(url, options = {}) {
             resolve(result);
           }
         } catch (e) {
+          const trimmed = (data || '').trimStart();
+          if (trimmed.startsWith('<')) {
+            return reject(new Error('HTML response (likely expired/invalid cookie or wrong URL)'));
+          }
           resolve(data);
         }
       });
@@ -158,6 +165,84 @@ const formatBytes = (bytes) => {
 const ensureDirectory = (dirPath) => {
   fs.mkdirSync(dirPath, { recursive: true });
 };
+
+// Normalize a JCR/DAM folder path: ensure single leading slash, no trailing slash,
+// and collapse any internal `//`. Returns '/' for empty input.
+const normalizeFolderPath = (p) => {
+  if (!p || typeof p !== 'string') return '/';
+  let out = p.trim().replace(/\/+/g, '/');
+  if (!out.startsWith('/')) out = '/' + out;
+  if (out.length > 1 && out.endsWith('/')) out = out.slice(0, -1);
+  return out;
+};
+
+// Decode the AEM login-token JWT from the cookie string and report its expiry.
+// Returns { ok, expDate, remainingSec, reason } or { ok: null, reason } if it
+// couldn't decode. Pure: no side effects, caller decides what to log/exit.
+function inspectCookieExpiry(cookieStr) {
+  if (!cookieStr) return { ok: null, reason: 'no cookie set' };
+
+  const match = cookieStr.match(/login-token=([^;]+)/);
+  if (!match) return { ok: null, reason: 'login-token not found in COOKIE' };
+
+  let tokenValue;
+  try { tokenValue = decodeURIComponent(match[1]); }
+  catch (e) { return { ok: null, reason: 'login-token URL-decoding failed' }; }
+
+  // Token format: "login:<jwt>:crx.default"
+  const jwtMatch = tokenValue.match(/^login:([^:]+)/);
+  const jwt = jwtMatch ? jwtMatch[1] : tokenValue;
+  const parts = jwt.split('.');
+  if (parts.length !== 3) return { ok: null, reason: 'login-token is not a JWT' };
+
+  let payload;
+  try {
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+    payload = JSON.parse(Buffer.from(padded, 'base64').toString('utf-8'));
+  } catch (e) {
+    return { ok: null, reason: 'JWT payload could not be decoded' };
+  }
+
+  if (!payload.exp) return { ok: null, reason: 'JWT has no exp claim' };
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const remainingSec = payload.exp - nowSec;
+  return {
+    ok: remainingSec > 0,
+    expDate: new Date(payload.exp * 1000),
+    remainingSec,
+    subject: payload.sub || null
+  };
+}
+
+// Run at startup. Exits the process if the cookie is already expired.
+function checkCookieExpiry() {
+  const info = inspectCookieExpiry(config.cookie);
+
+  if (info.ok === null) {
+    console.log(`Cookie expiry check skipped: ${info.reason}`);
+    return;
+  }
+
+  const mins = Math.floor(Math.abs(info.remainingSec) / 60);
+  const hrs = Math.floor(mins / 60);
+  const remainingStr = `${hrs}h ${mins % 60}m`;
+
+  if (!info.ok) {
+    console.error('\nERROR: login-token cookie has expired.');
+    console.error(`   Expired at: ${info.expDate.toString()}`);
+    console.error(`   Expired ${remainingStr} ago.`);
+    console.error('   Refresh your cookie from the browser and update .env, then re-run.');
+    process.exit(1);
+  }
+
+  if (info.remainingSec < 30 * 60) {
+    console.log(`Warning: cookie expires in ${remainingStr} (at ${info.expDate.toLocaleTimeString()}). Refresh soon.`);
+  } else {
+    console.log(`Cookie valid for ${remainingStr} (until ${info.expDate.toLocaleString()})`);
+  }
+}
 
 // ============================================
 // QUERY-BASED ASSET FUNCTIONS
@@ -403,39 +488,60 @@ async function processQueryAssets(assetPaths) {
  * Find assets matching a pattern in the DAM
  */
 async function findAssets(pattern) {
-  console.log('\nSEARCHING FOR ASSETS');
+  console.log('\nSEARCHING FOR ASSETS (QueryBuilder)');
   console.log('='.repeat(60));
   console.log(`Search pattern: "${pattern}"`);
 
-  // Normalize the pattern
-  const searchPattern = pattern.toLowerCase();
+  // Substring semantics: wrap in wildcards unless the caller already used them.
+  const nodename = pattern.includes('*') ? pattern : `*${pattern}*`;
+  const qs = [
+    'path=' + encodeURIComponent('/content/dam'),
+    'type=' + encodeURIComponent('dam:Asset'),
+    'nodename=' + encodeURIComponent(nodename),
+    'p.limit=500',
+    'p.hits=full'
+  ].join('&');
+  const url = `${config.baseUrl}/bin/querybuilder.json?${qs}`;
+
+  let response;
+  try {
+    response = await makeRequestWithRetry(url);
+  } catch (e) {
+    console.error(`QueryBuilder request failed: ${e.message}`);
+    return [];
+  }
+
+  if (!response || typeof response !== 'object' || !Array.isArray(response.hits)) {
+    console.error('QueryBuilder returned an unexpected response (check cookie/permissions).');
+    return [];
+  }
+
+  console.log(`QueryBuilder: ${response.hits.length} hit(s)` +
+    (response.total != null ? ` (total reported: ${response.total})` : ''));
+
   const foundAssets = [];
-  const searchResults = new Map();
+  const seen = new Set();
 
-  // Start discovery but track matches
-  config.folderQueue.push('/content/dam');
+  for (const hit of response.hits) {
+    const itemPath = hit['jcr:path'];
+    if (!itemPath || seen.has(itemPath)) continue;
+    seen.add(itemPath);
 
-  while (config.folderQueue.length > 0) {
-    const currentPath = config.folderQueue.shift();
+    // QB hits often omit deep metadata; fetch the asset's own JSON for full info.
+    let assetData = hit;
+    try {
+      const full = await makeRequestWithRetry(`${config.baseUrl}${itemPath}.json`);
+      if (full && typeof full === 'object') assetData = full;
+    } catch (e) {
+      // Fall back to QB hit
+    }
 
-    if (config.processedPaths.has(currentPath)) continue;
-    config.processedPaths.add(currentPath);
-
-    const matches = await searchInFolder(currentPath, searchPattern);
-    matches.forEach(match => {
-      if (!searchResults.has(match.path)) {
-        searchResults.set(match.path, match);
-        foundAssets.push(match);
-        console.log(`Found: ${match.path}`);
-        console.log(`   Name: ${match.name}`);
-        console.log(`   Size: ${match.size ? formatBytes(match.size) : 'Unknown'}`);
-        console.log(`   Match: ${match.matchReason}\n`);
-      }
-    });
-
-    // Add small delay to be nice to server
-    if (config.stats.foldersScanned % 5 === 0) {
-      await sleep(config.sleepTime);
+    const assetInfo = extractAssetInfo(assetData, itemPath);
+    if (assetInfo && isValidAsset(assetInfo)) {
+      assetInfo.matchReason = 'QueryBuilder nodename match';
+      foundAssets.push(assetInfo);
+      console.log(`Found: ${assetInfo.path}`);
+      console.log(`   Size: ${assetInfo.size ? formatBytes(assetInfo.size) : 'Unknown'}`);
     }
   }
 
@@ -445,10 +551,9 @@ async function findAssets(pattern) {
 
   if (foundAssets.length === 0) {
     console.log('Search tips:');
-    console.log('- Try a shorter pattern (e.g., "icon2" instead of "icon2-returns")');
-    console.log('- Use filename only (e.g., "returns.png")');
-    console.log('- Try partial timestamp (e.g., "1683123")');
-    console.log('- Check if the asset exists in a different location');
+    console.log('- Try a shorter pattern (matching is against the node name only)');
+    console.log('- Use "*" wildcards explicitly if needed, e.g. "*radio*"');
+    console.log('- Verify the asset exists under /content/dam');
   }
 
   return foundAssets;
@@ -487,54 +592,35 @@ async function findFromString(searchString) {
   }
 }
 async function findMultipleAssets(patterns) {
-  console.log('\nSEARCHING FOR MULTIPLE PATTERNS');
+  console.log('\nSEARCHING FOR MULTIPLE PATTERNS (QueryBuilder)');
   console.log('='.repeat(60));
   console.log(`Search patterns: ${patterns.map(p => `"${p}"`).join(', ')}`);
 
-  // Normalize the patterns
-  const searchPatterns = patterns.map(pattern => pattern.toLowerCase());
   const foundAssets = [];
   const searchResults = new Map();
 
-  // Start discovery but track matches
-  config.folderQueue.push('/content/dam');
-
-  while (config.folderQueue.length > 0) {
-    const currentPath = config.folderQueue.shift();
-
-    if (config.processedPaths.has(currentPath)) continue;
-    config.processedPaths.add(currentPath);
-
-    const matches = await searchInFolderMultiple(currentPath, searchPatterns);
-    matches.forEach(match => {
+  // One QueryBuilder request per pattern, so each hit retains its matchedPattern attribution.
+  for (const pattern of patterns) {
+    const matches = await findAssets(pattern);
+    for (const match of matches) {
+      match.matchedPattern = pattern;
       if (!searchResults.has(match.path)) {
         searchResults.set(match.path, match);
         foundAssets.push(match);
-        console.log(`Found: ${match.path}`);
-        console.log(`   Name: ${match.name}`);
-        console.log(`   Size: ${match.size ? formatBytes(match.size) : 'Unknown'}`);
-        console.log(`   Match: ${match.matchReason} (pattern: "${match.matchedPattern}")\n`);
       }
-    });
-
-    // Add small delay to be nice to server
-    if (config.stats.foldersScanned % 5 === 0) {
-      await sleep(config.sleepTime);
     }
   }
 
   console.log('='.repeat(60));
-  console.log(`SEARCH COMPLETE: Found ${foundAssets.length} matching assets`);
+  console.log(`MULTI-PATTERN SEARCH COMPLETE: Found ${foundAssets.length} unique assets`);
   console.log('='.repeat(60) + '\n');
 
   if (foundAssets.length === 0) {
     console.log('Search tips:');
     console.log('- Try shorter patterns');
-    console.log('- Use filename only instead of full paths');
-    console.log('- Try partial timestamps or identifiers');
-    console.log('- Check if the assets exist in different locations');
+    console.log('- Use "*" wildcards explicitly if needed, e.g. "*radio*"');
+    console.log('- Verify the assets exist under /content/dam');
   } else {
-    // Show summary by pattern
     console.log('Results by pattern:');
     patterns.forEach(pattern => {
       const matches = foundAssets.filter(asset =>
@@ -553,8 +639,13 @@ async function findMultipleAssets(patterns) {
 async function searchInFolder(folderPath, pattern) {
   config.stats.foldersScanned++;
 
-  const jsonDepths = ['.1.json', '.json', '.2.json', '.3.json'];
+  const jsonDepths = config.smartDepthDetection
+    ? ['.1.json', '.json', '.2.json', '.3.json', '.4.json', '.5.json']
+    : ['.1.json', '.json'];
+
   let bestData = null;
+  let maxItems = 0;
+  const errors = [];
 
   for (const jsonDepth of jsonDepths) {
     try {
@@ -562,15 +653,21 @@ async function searchInFolder(folderPath, pattern) {
       const data = await makeRequestWithRetry(url);
 
       if (data && typeof data === 'object') {
-        bestData = data;
-        break; // Use first successful response
+        const itemCount = Object.keys(data).filter(k => !k.startsWith('jcr:') && !k.startsWith(':')).length;
+        if (itemCount > maxItems || (bestData === null && itemCount >= 0)) {
+          maxItems = itemCount;
+          bestData = data;
+          if (itemCount > 50) break;
+        }
       }
     } catch (error) {
-      // Silent fail, try next depth
+      errors.push(`${jsonDepth}: ${error.message}`);
     }
   }
 
   if (!bestData) {
+    console.log(`Warning: could not load ${folderPath} (all depths failed)`);
+    if (errors.length) console.log(`   ${errors.join('; ')}`);
     return [];
   }
 
@@ -584,8 +681,13 @@ async function searchInFolder(folderPath, pattern) {
 async function searchInFolderMultiple(folderPath, patterns) {
   config.stats.foldersScanned++;
 
-  const jsonDepths = ['.1.json', '.json', '.2.json', '.3.json'];
+  const jsonDepths = config.smartDepthDetection
+    ? ['.1.json', '.json', '.2.json', '.3.json', '.4.json', '.5.json']
+    : ['.1.json', '.json'];
+
   let bestData = null;
+  let maxItems = 0;
+  const errors = [];
 
   for (const jsonDepth of jsonDepths) {
     try {
@@ -593,15 +695,21 @@ async function searchInFolderMultiple(folderPath, patterns) {
       const data = await makeRequestWithRetry(url);
 
       if (data && typeof data === 'object') {
-        bestData = data;
-        break; // Use first successful response
+        const itemCount = Object.keys(data).filter(k => !k.startsWith('jcr:') && !k.startsWith(':')).length;
+        if (itemCount > maxItems || (bestData === null && itemCount >= 0)) {
+          maxItems = itemCount;
+          bestData = data;
+          if (itemCount > 50) break;
+        }
       }
     } catch (error) {
-      // Silent fail, try next depth
+      errors.push(`${jsonDepth}: ${error.message}`);
     }
   }
 
   if (!bestData) {
+    console.log(`Warning: could not load ${folderPath} (all depths failed)`);
+    if (errors.length) console.log(`   ${errors.join('; ')}`);
     return [];
   }
 
@@ -819,8 +927,10 @@ async function discoverAllAssets() {
   console.log('\nStarting Intelligent DAM Discovery...\n');
   console.log('='.repeat(60));
 
-  // Start with root
-  config.folderQueue.push('/content/dam');
+  // If --folder pre-seeded the queue, respect it; otherwise scan the whole DAM.
+  if (config.folderQueue.length === 0) {
+    config.folderQueue.push('/content/dam');
+  }
 
   while (config.folderQueue.length > 0) {
     const currentPath = config.folderQueue.shift();
@@ -875,6 +985,7 @@ async function scanFolder(folderPath, depth = 0) {
   let bestData = null;
   let bestDepth = null;
   let maxItems = 0;
+  const errors = [];
 
   for (const jsonDepth of jsonDepths) {
     try {
@@ -895,11 +1006,13 @@ async function scanFolder(folderPath, depth = 0) {
         }
       }
     } catch (error) {
-      // Silent fail, try next depth
+      errors.push(`${jsonDepth}: ${error.message}`);
     }
   }
 
   if (!bestData) {
+    console.log(`Warning: could not load ${folderPath} (all depths failed)`);
+    if (errors.length) console.log(`   ${errors.join('; ')}`);
     return;
   }
 
@@ -1227,12 +1340,12 @@ async function downloadAllAssets(assets) {
  */
 async function downloadAsset(assetInfo) {
   try {
-    // Create output path
-    const relativePath = assetInfo.path.replace('/content/dam', '').replace(/^\//, '');
-    const outputDir = path.join(config.outputDir, path.dirname(relativePath));
+    // Flat output: every asset lands directly under config.outputDir, by filename only.
+    // (DAM hierarchy is preserved in the metadata.json sidecar, not the on-disk path.)
+    const outputDir = config.outputDir;
     ensureDirectory(outputDir);
 
-    const outputPath = path.join(config.outputDir, relativePath);
+    const outputPath = path.join(outputDir, assetInfo.name);
 
     // Check if already exists
     if (fs.existsSync(outputPath)) {
@@ -1538,7 +1651,7 @@ async function main() {
   } else if (config.queryMode) {
     console.log("QUERY MODE - Downloading specific assets");
   } else if (config.testMode) {
-    console.log("TEST MODE - Will download only 10 assets");
+    console.log(`TEST MODE - Will download only ${config.testLimit} assets`);
   }
 
   console.log("=".repeat(60));
@@ -1567,6 +1680,8 @@ async function main() {
     console.log('COOKIE="your-cookie-here" node script.js\n');
     process.exit(1);
   }
+
+  checkCookieExpiry();
 
   // Test connection
   console.log('\nTesting connection...');
@@ -1926,7 +2041,11 @@ Features:
       if (config.queryMode || config.findMode) {
         console.log('Warning: --folder ignored in query/find mode');
       } else {
-        config.folderQueue = [args[i + 1]];
+        const normalized = normalizeFolderPath(args[i + 1]);
+        if (normalized !== args[i + 1]) {
+          console.log(`Normalized folder path: "${args[i + 1]}" -> "${normalized}"`);
+        }
+        config.folderQueue = [normalized];
       }
       i++;
     } else if (args[i] === '--no-renditions') {
