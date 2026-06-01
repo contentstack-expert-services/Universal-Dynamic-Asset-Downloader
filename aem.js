@@ -41,7 +41,7 @@ const config = {
   fileTypes: [], // Empty = all types, or ['jpg', 'png', 'pdf']
   minFileSize: 0,
   maxFileSize: 5000000000, // 5GB
-  skipPatterns: ['.tmp', '.temp', 'thumb_', 'thumbnail', '.cache', 'cq5dam.thumbnail'],
+  skipPatterns: ['.tmp', '.temp', 'thumb_', '.cache', 'cq5dam.thumbnail'],
 
   // Smart discovery settings
   smartDepthDetection: true,
