@@ -176,6 +176,74 @@ const normalizeFolderPath = (p) => {
   return out;
 };
 
+// Decode the AEM login-token JWT from the cookie string and report its expiry.
+// Returns { ok, expDate, remainingSec, reason } or { ok: null, reason } if it
+// couldn't decode. Pure: no side effects, caller decides what to log/exit.
+function inspectCookieExpiry(cookieStr) {
+  if (!cookieStr) return { ok: null, reason: 'no cookie set' };
+
+  const match = cookieStr.match(/login-token=([^;]+)/);
+  if (!match) return { ok: null, reason: 'login-token not found in COOKIE' };
+
+  let tokenValue;
+  try { tokenValue = decodeURIComponent(match[1]); }
+  catch (e) { return { ok: null, reason: 'login-token URL-decoding failed' }; }
+
+  // Token format: "login:<jwt>:crx.default"
+  const jwtMatch = tokenValue.match(/^login:([^:]+)/);
+  const jwt = jwtMatch ? jwtMatch[1] : tokenValue;
+  const parts = jwt.split('.');
+  if (parts.length !== 3) return { ok: null, reason: 'login-token is not a JWT' };
+
+  let payload;
+  try {
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+    payload = JSON.parse(Buffer.from(padded, 'base64').toString('utf-8'));
+  } catch (e) {
+    return { ok: null, reason: 'JWT payload could not be decoded' };
+  }
+
+  if (!payload.exp) return { ok: null, reason: 'JWT has no exp claim' };
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const remainingSec = payload.exp - nowSec;
+  return {
+    ok: remainingSec > 0,
+    expDate: new Date(payload.exp * 1000),
+    remainingSec,
+    subject: payload.sub || null
+  };
+}
+
+// Run at startup. Exits the process if the cookie is already expired.
+function checkCookieExpiry() {
+  const info = inspectCookieExpiry(config.cookie);
+
+  if (info.ok === null) {
+    console.log(`Cookie expiry check skipped: ${info.reason}`);
+    return;
+  }
+
+  const mins = Math.floor(Math.abs(info.remainingSec) / 60);
+  const hrs = Math.floor(mins / 60);
+  const remainingStr = `${hrs}h ${mins % 60}m`;
+
+  if (!info.ok) {
+    console.error('\nERROR: login-token cookie has expired.');
+    console.error(`   Expired at: ${info.expDate.toString()}`);
+    console.error(`   Expired ${remainingStr} ago.`);
+    console.error('   Refresh your cookie from the browser and update .env, then re-run.');
+    process.exit(1);
+  }
+
+  if (info.remainingSec < 30 * 60) {
+    console.log(`Warning: cookie expires in ${remainingStr} (at ${info.expDate.toLocaleTimeString()}). Refresh soon.`);
+  } else {
+    console.log(`Cookie valid for ${remainingStr} (until ${info.expDate.toLocaleString()})`);
+  }
+}
+
 // ============================================
 // QUERY-BASED ASSET FUNCTIONS
 // ============================================
@@ -858,8 +926,10 @@ async function discoverAllAssets() {
   console.log('\nStarting Intelligent DAM Discovery...\n');
   console.log('='.repeat(60));
 
-  // Start with root
-  config.folderQueue.push('/content/dam');
+  // If --folder pre-seeded the queue, respect it; otherwise scan the whole DAM.
+  if (config.folderQueue.length === 0) {
+    config.folderQueue.push('/content/dam');
+  }
 
   while (config.folderQueue.length > 0) {
     const currentPath = config.folderQueue.shift();
@@ -1580,7 +1650,7 @@ async function main() {
   } else if (config.queryMode) {
     console.log("QUERY MODE - Downloading specific assets");
   } else if (config.testMode) {
-    console.log("TEST MODE - Will download only 10 assets");
+    console.log(`TEST MODE - Will download only ${config.testLimit} assets`);
   }
 
   console.log("=".repeat(60));
@@ -1609,6 +1679,8 @@ async function main() {
     console.log('COOKIE="your-cookie-here" node script.js\n');
     process.exit(1);
   }
+
+  checkCookieExpiry();
 
   // Test connection
   console.log('\nTesting connection...');
