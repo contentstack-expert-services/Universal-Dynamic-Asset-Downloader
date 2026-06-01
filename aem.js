@@ -488,39 +488,60 @@ async function processQueryAssets(assetPaths) {
  * Find assets matching a pattern in the DAM
  */
 async function findAssets(pattern) {
-  console.log('\nSEARCHING FOR ASSETS');
+  console.log('\nSEARCHING FOR ASSETS (QueryBuilder)');
   console.log('='.repeat(60));
   console.log(`Search pattern: "${pattern}"`);
 
-  // Normalize the pattern
-  const searchPattern = pattern.toLowerCase();
+  // Substring semantics: wrap in wildcards unless the caller already used them.
+  const nodename = pattern.includes('*') ? pattern : `*${pattern}*`;
+  const qs = [
+    'path=' + encodeURIComponent('/content/dam'),
+    'type=' + encodeURIComponent('dam:Asset'),
+    'nodename=' + encodeURIComponent(nodename),
+    'p.limit=500',
+    'p.hits=full'
+  ].join('&');
+  const url = `${config.baseUrl}/bin/querybuilder.json?${qs}`;
+
+  let response;
+  try {
+    response = await makeRequestWithRetry(url);
+  } catch (e) {
+    console.error(`QueryBuilder request failed: ${e.message}`);
+    return [];
+  }
+
+  if (!response || typeof response !== 'object' || !Array.isArray(response.hits)) {
+    console.error('QueryBuilder returned an unexpected response (check cookie/permissions).');
+    return [];
+  }
+
+  console.log(`QueryBuilder: ${response.hits.length} hit(s)` +
+    (response.total != null ? ` (total reported: ${response.total})` : ''));
+
   const foundAssets = [];
-  const searchResults = new Map();
+  const seen = new Set();
 
-  // Start discovery but track matches
-  config.folderQueue.push('/content/dam');
+  for (const hit of response.hits) {
+    const itemPath = hit['jcr:path'];
+    if (!itemPath || seen.has(itemPath)) continue;
+    seen.add(itemPath);
 
-  while (config.folderQueue.length > 0) {
-    const currentPath = config.folderQueue.shift();
+    // QB hits often omit deep metadata; fetch the asset's own JSON for full info.
+    let assetData = hit;
+    try {
+      const full = await makeRequestWithRetry(`${config.baseUrl}${itemPath}.json`);
+      if (full && typeof full === 'object') assetData = full;
+    } catch (e) {
+      // Fall back to QB hit
+    }
 
-    if (config.processedPaths.has(currentPath)) continue;
-    config.processedPaths.add(currentPath);
-
-    const matches = await searchInFolder(currentPath, searchPattern);
-    matches.forEach(match => {
-      if (!searchResults.has(match.path)) {
-        searchResults.set(match.path, match);
-        foundAssets.push(match);
-        console.log(`Found: ${match.path}`);
-        console.log(`   Name: ${match.name}`);
-        console.log(`   Size: ${match.size ? formatBytes(match.size) : 'Unknown'}`);
-        console.log(`   Match: ${match.matchReason}\n`);
-      }
-    });
-
-    // Add small delay to be nice to server
-    if (config.stats.foldersScanned % 5 === 0) {
-      await sleep(config.sleepTime);
+    const assetInfo = extractAssetInfo(assetData, itemPath);
+    if (assetInfo && isValidAsset(assetInfo)) {
+      assetInfo.matchReason = 'QueryBuilder nodename match';
+      foundAssets.push(assetInfo);
+      console.log(`Found: ${assetInfo.path}`);
+      console.log(`   Size: ${assetInfo.size ? formatBytes(assetInfo.size) : 'Unknown'}`);
     }
   }
 
@@ -530,10 +551,9 @@ async function findAssets(pattern) {
 
   if (foundAssets.length === 0) {
     console.log('Search tips:');
-    console.log('- Try a shorter pattern (e.g., "icon2" instead of "icon2-returns")');
-    console.log('- Use filename only (e.g., "returns.png")');
-    console.log('- Try partial timestamp (e.g., "1683123")');
-    console.log('- Check if the asset exists in a different location');
+    console.log('- Try a shorter pattern (matching is against the node name only)');
+    console.log('- Use "*" wildcards explicitly if needed, e.g. "*radio*"');
+    console.log('- Verify the asset exists under /content/dam');
   }
 
   return foundAssets;
@@ -572,54 +592,35 @@ async function findFromString(searchString) {
   }
 }
 async function findMultipleAssets(patterns) {
-  console.log('\nSEARCHING FOR MULTIPLE PATTERNS');
+  console.log('\nSEARCHING FOR MULTIPLE PATTERNS (QueryBuilder)');
   console.log('='.repeat(60));
   console.log(`Search patterns: ${patterns.map(p => `"${p}"`).join(', ')}`);
 
-  // Normalize the patterns
-  const searchPatterns = patterns.map(pattern => pattern.toLowerCase());
   const foundAssets = [];
   const searchResults = new Map();
 
-  // Start discovery but track matches
-  config.folderQueue.push('/content/dam');
-
-  while (config.folderQueue.length > 0) {
-    const currentPath = config.folderQueue.shift();
-
-    if (config.processedPaths.has(currentPath)) continue;
-    config.processedPaths.add(currentPath);
-
-    const matches = await searchInFolderMultiple(currentPath, searchPatterns);
-    matches.forEach(match => {
+  // One QueryBuilder request per pattern, so each hit retains its matchedPattern attribution.
+  for (const pattern of patterns) {
+    const matches = await findAssets(pattern);
+    for (const match of matches) {
+      match.matchedPattern = pattern;
       if (!searchResults.has(match.path)) {
         searchResults.set(match.path, match);
         foundAssets.push(match);
-        console.log(`Found: ${match.path}`);
-        console.log(`   Name: ${match.name}`);
-        console.log(`   Size: ${match.size ? formatBytes(match.size) : 'Unknown'}`);
-        console.log(`   Match: ${match.matchReason} (pattern: "${match.matchedPattern}")\n`);
       }
-    });
-
-    // Add small delay to be nice to server
-    if (config.stats.foldersScanned % 5 === 0) {
-      await sleep(config.sleepTime);
     }
   }
 
   console.log('='.repeat(60));
-  console.log(`SEARCH COMPLETE: Found ${foundAssets.length} matching assets`);
+  console.log(`MULTI-PATTERN SEARCH COMPLETE: Found ${foundAssets.length} unique assets`);
   console.log('='.repeat(60) + '\n');
 
   if (foundAssets.length === 0) {
     console.log('Search tips:');
     console.log('- Try shorter patterns');
-    console.log('- Use filename only instead of full paths');
-    console.log('- Try partial timestamps or identifiers');
-    console.log('- Check if the assets exist in different locations');
+    console.log('- Use "*" wildcards explicitly if needed, e.g. "*radio*"');
+    console.log('- Verify the assets exist under /content/dam');
   } else {
-    // Show summary by pattern
     console.log('Results by pattern:');
     patterns.forEach(pattern => {
       const matches = foundAssets.filter(asset =>
